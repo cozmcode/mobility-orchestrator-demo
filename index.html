@@ -782,7 +782,7 @@ tbody td.mono { font-family: var(--font-mono); font-size: 12px; }
 <div class="voice-chat-panel hidden" id="voiceChatPanel">
   <div class="voice-chat-header">
     <span class="voice-chat-title">Mira</span>
-    <button class="voice-chat-close" onclick="document.getElementById('voiceChatPanel').classList.add('hidden')">&times;</button>
+    <button class="voice-chat-close" onclick="toggleVoiceChatPanel()">&times;</button>
   </div>
   <div class="voice-chat-messages" id="voiceChatMessages">
     <div class="voice-chat-empty">Mira is ready to help&hellip;</div>
@@ -952,6 +952,7 @@ function applyFilters() {
   document.getElementById('stat-countries').textContent = ctySet.size;
 
   initTab(currentTab);
+  debouncedMiraContextUpdate();
 }
 
 // ══ Tab Switching ════════════════════════════════════════════════════════════
@@ -962,6 +963,7 @@ function switchTab(tab) {
   document.querySelectorAll('.tab-content').forEach(function(c) { c.classList.remove('active'); });
   document.getElementById('tab-' + tab).classList.add('active');
   initTab(tab);
+  debouncedMiraContextUpdate();
 }
 
 function initTab(tab) {
@@ -1275,23 +1277,805 @@ function exportTable() {
   URL.revokeObjectURL(url);
 }
 
-// ══ Voice / Mira (Placeholder) ══════════════════════════════════════════════
-function showVoiceToast(msg) {
-  var el = document.getElementById('voiceToast');
-  el.textContent = msg;
-  el.classList.add('visible');
-  setTimeout(function() { el.classList.remove('visible'); }, 3000);
+// ══ Tab Info & Navigation Helpers (for Mira) ═════════════════════════════════
+var TAB_INFO = {
+  overview: { label: 'Overview', kpiEl: 'kpi-overview' },
+  immigration: { label: 'Immigration', kpiEl: 'kpi-immigration' },
+  tax_personal: { label: 'Personal Tax', kpiEl: null },
+  tax_corporate: { label: 'Corporate Tax', kpiEl: null },
+  mobility: { label: 'Global Mobility', kpiEl: null },
+  costs: { label: 'Costs', kpiEl: null }
+};
+var TAB_ORDER = Object.keys(TAB_INFO);
+
+function getTabLabel(tab) {
+  return (TAB_INFO[tab] && TAB_INFO[tab].label) || tab;
+}
+
+function getRelativeTab(offset) {
+  var index = TAB_ORDER.indexOf(currentTab);
+  if (index === -1) return currentTab;
+  var nextIndex = Math.max(0, Math.min(TAB_ORDER.length - 1, index + offset));
+  return TAB_ORDER[nextIndex];
+}
+
+function normalizeTabName(input) {
+  if (!input) return null;
+  var raw = String(input).trim();
+  var key = raw.toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+
+  if (key === 'next' || key === 'next tab' || key === 'next screen' || key === 'next page') return getRelativeTab(1);
+  if (key === 'previous' || key === 'previous tab' || key === 'previous screen' || key === 'back' || key === 'last screen') return getRelativeTab(-1);
+
+  var aliasMap = {
+    overview: ['overview', 'overview tab', 'overview screen', 'home', 'dashboard', 'main screen'],
+    immigration: ['immigration', 'immigration tab', 'immigration screen', 'visa', 'visas', 'cases', 'case management'],
+    tax_personal: ['personal tax', 'personal tax tab', 'tax personal', 'individual tax', 'employee tax'],
+    tax_corporate: ['corporate tax', 'corporate tax tab', 'company tax', 'permanent establishment', 'pe'],
+    mobility: ['global mobility', 'mobility', 'mobility tab', 'social security', 'a1', 'a1 certificate'],
+    costs: ['costs', 'cost', 'cost screen', 'spend', 'expenses']
+  };
+
+  for (var tab in aliasMap) {
+    if (aliasMap[tab].includes(key)) return tab;
+  }
+  return TAB_INFO[key] ? key : null;
+}
+
+function normalizeCountryFilter(input) {
+  if (!input) return null;
+  var key = String(input).trim().toLowerCase();
+  if (!key || key === 'all' || key === 'all countries' || key === 'any country') return 'All';
+  for (var code in DATA.country_names) {
+    if (code.toLowerCase() === key) return code;
+    if (String(DATA.country_names[code]).trim().toLowerCase() === key) return code;
+  }
+  return null;
+}
+
+function normalizeStatusFilter(input) {
+  if (!input) return null;
+  var key = String(input).trim().toLowerCase();
+  if (!key || key === 'all' || key === 'all statuses' || key === 'any status') return 'All';
+  if (key === 'received' || key === 'new') return 'Received';
+  if (key === 'in progress' || key === 'in-progress' || key === 'processing') return 'In Progress';
+  if (key === 'filed' || key === 'submitted') return 'Filed';
+  if (key === 'approved') return 'Approved';
+  if (key === 'completed' || key === 'complete' || key === 'done') return 'Completed';
+  return null;
+}
+
+function getActiveFilterState() {
+  var countryEl = document.getElementById('filt-country');
+  var entityEl = document.getElementById('filt-entity');
+  var statusEl = document.getElementById('filt-status');
+  var fromEl = document.getElementById('filt-from');
+  var toEl = document.getElementById('filt-to');
+  var searchEl = document.getElementById('filt-search');
+
+  return {
+    country: countryEl ? (countryEl.selectedOptions[0] ? countryEl.selectedOptions[0].textContent.trim() : countryEl.value) : '',
+    entity: entityEl ? (entityEl.selectedOptions[0] ? entityEl.selectedOptions[0].textContent.trim() : entityEl.value) : '',
+    status: statusEl ? (statusEl.selectedOptions[0] ? statusEl.selectedOptions[0].textContent.trim() : statusEl.value) : '',
+    from: fromEl ? fromEl.value : '',
+    to: toEl ? toEl.value : '',
+    search: searchEl ? searchEl.value.trim() : ''
+  };
+}
+
+function getCurrentKpiSnapshot() {
+  var cfg = TAB_INFO[currentTab];
+  if (!cfg || !cfg.kpiEl) return [];
+  var container = document.getElementById(cfg.kpiEl);
+  if (!container) return [];
+  return Array.from(container.querySelectorAll('.kpi-card')).map(function(card) {
+    var label = card.querySelector('.kpi-label');
+    var value = card.querySelector('.kpi-value');
+    return {
+      label: label ? label.textContent.replace(/\s+/g, ' ').trim() : '',
+      value: value ? value.textContent.replace(/\s+/g, ' ').trim() : ''
+    };
+  }).filter(function(item) { return item.label && item.value; });
+}
+
+function getVisibleSectionTitles(tabEl) {
+  if (!tabEl) return [];
+  var seen = new Set();
+  return Array.from(tabEl.querySelectorAll('.card-header, .callout h3')).map(function(el) {
+    return el.textContent.replace(/\s+/g, ' ').trim();
+  }).filter(function(text) {
+    if (!text || seen.has(text)) return false;
+    seen.add(text);
+    return true;
+  });
+}
+
+function getVisibleTablePreview(tabEl) {
+  if (!tabEl) return [];
+  return Array.from(tabEl.querySelectorAll('table')).map(function(table) {
+    var titleEl = table.closest('.table-card') ? table.closest('.table-card').querySelector('h3') : null;
+    var bodyRows = Array.from(table.querySelectorAll('tbody tr'));
+    return {
+      title: titleEl ? titleEl.textContent.replace(/\s+/g, ' ').trim() : 'table',
+      row_count: bodyRows.length
+    };
+  }).filter(function(t) { return t.title; }).slice(0, 2);
+}
+
+function getCurrentViewContext() {
+  var tabEl = document.getElementById('tab-' + currentTab);
+  var filters = getActiveFilterState();
+  var cleanFilters = {};
+  Object.keys(filters).forEach(function(key) {
+    if (filters[key] && filters[key] !== 'All Destinations' && filters[key] !== 'All Entities' && filters[key] !== 'All Statuses' && filters[key] !== 'All') {
+      cleanFilters[key] = filters[key];
+    }
+  });
+
+  var view = {
+    tab_id: currentTab,
+    tab_label: getTabLabel(currentTab),
+    mode: DATA_MODE,
+    filtered_case_count: filteredCases.length,
+    filters: cleanFilters,
+    kpis: getCurrentKpiSnapshot().slice(0, 5),
+    sections: getVisibleSectionTitles(tabEl).slice(0, 8),
+    tables: getVisibleTablePreview(tabEl)
+  };
+
+  var summaryParts = [];
+  summaryParts.push('Current screen is ' + view.tab_label);
+  if (view.kpis.length) {
+    summaryParts.push('visible KPIs are ' + view.kpis.map(function(kpi) {
+      return kpi.label + ' ' + kpi.value;
+    }).join(', '));
+  }
+  if (view.sections.length) {
+    summaryParts.push('visible sections are ' + view.sections.join(', '));
+  }
+  if (view.tables.length) {
+    summaryParts.push('visible tables are ' + view.tables.map(function(table) {
+      return table.title + ' with ' + table.row_count + ' rows';
+    }).join(', '));
+  }
+  if (Object.keys(view.filters).length) {
+    summaryParts.push('active filters are ' + Object.keys(view.filters).map(function(key) {
+      return key.replace(/_/g, ' ') + ': ' + view.filters[key];
+    }).join(', '));
+  }
+  view.screen_description = summaryParts.join('. ') + '.';
+  return view;
+}
+
+function getCurrentViewSummary() {
+  var view = getCurrentViewContext();
+  return {
+    tab_id: view.tab_id,
+    tab_label: view.tab_label,
+    mode: view.mode,
+    filtered_case_count: view.filtered_case_count,
+    filters: view.filters,
+    kpis: view.kpis,
+    sections: view.sections,
+    tables: view.tables
+  };
+}
+
+function refreshVoiceContext() {
+  if (currentMode === 'realtime' && realtimeManager && realtimeManager.isConnected) {
+    realtimeManager.sendTools();
+  }
+}
+
+// ══ Trend Summary for Mira ════════════════════════════════════════════════════
+function formatTrendMonth(month) {
+  var parts = String(month || '').split('-');
+  if (parts.length !== 2) return String(month || '');
+  var names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  var monthIndex = parseInt(parts[1], 10) - 1;
+  return (names[monthIndex] || parts[1]) + ' ' + parts[0];
+}
+
+function getTrendSummary() {
+  if (currentTab !== 'immigration') {
+    return 'There is no dedicated time-series trend chart on the ' + getTabLabel(currentTab) + ' tab. Use the screen summary tools for the current KPIs and visible tables instead.';
+  }
+
+  // Compute cases by month from data
+  var byMonth = {};
+  filteredCases.forEach(function(c) {
+    var m = c.filed_date ? c.filed_date.substring(0, 7) : null;
+    if (!m) return;
+    if (!byMonth[m]) byMonth[m] = { total: 0, received: 0, in_progress: 0, filed: 0, approved: 0, completed: 0 };
+    byMonth[m].total++;
+    var s = c.status.toLowerCase().replace(/\s+/g, '_');
+    if (s === 'received') byMonth[m].received++;
+    else if (s === 'in_progress') byMonth[m].in_progress++;
+    else if (s === 'filed') byMonth[m].filed++;
+    else if (s === 'approved') byMonth[m].approved++;
+    else if (s === 'completed') byMonth[m].completed++;
+  });
+
+  var months = Object.keys(byMonth).sort();
+  if (!months.length) return 'No immigration trend data is available for the current filters.';
+
+  var first = months[0];
+  var last = months[months.length - 1];
+  var peak = months.reduce(function(best, m) { return byMonth[m].total > byMonth[best].total ? m : best; }, months[0]);
+
+  return 'Immigration case trend summary: cases were filed from ' + formatTrendMonth(first) +
+    ' to ' + formatTrendMonth(last) + '. Peak filing month is ' + formatTrendMonth(peak) +
+    ' with ' + byMonth[peak].total + ' cases. The latest month (' + formatTrendMonth(last) +
+    ') has ' + byMonth[last].total + ' cases, including ' + byMonth[last].approved +
+    ' approved, ' + byMonth[last].filed + ' filed, ' + byMonth[last].in_progress +
+    ' in progress, and ' + byMonth[last].received + ' received.';
+}
+
+// ══ Tab Summary for Mira ══════════════════════════════════════════════════════
+function getTabSummary() {
+  var cases = filteredCases;
+  var filters = getActiveFilterState();
+  var filterNote = '';
+  var activeFilters = [];
+  if (filters.country && filters.country !== 'All Destinations' && filters.country !== 'All') activeFilters.push('Destination=' + filters.country);
+  if (filters.status && filters.status !== 'All Statuses' && filters.status !== 'All') activeFilters.push('Status=' + filters.status);
+  if (filters.entity && filters.entity !== 'All Entities' && filters.entity !== 'All') activeFilters.push('Entity=' + filters.entity);
+  if (activeFilters.length) filterNote = ' (Filtered: ' + activeFilters.join(', ') + ')';
+
+  if (currentTab === 'overview') {
+    return 'Overview Tab' + filterNote + ': This is the Mobility Orchestrator demo dashboard. ' +
+      cases.length + ' immigration cases across ' + new Set(cases.map(function(c) { return c.destination; })).size + ' destination countries. ' +
+      'Navigate to the Immigration tab for detailed case management views.';
+  }
+
+  if (currentTab === 'immigration') {
+    var statusDist = {};
+    cases.forEach(function(c) { statusDist[c.status] = (statusDist[c.status] || 0) + 1; });
+    var statusStr = Object.entries(statusDist).map(function(e) { return e[0] + ': ' + e[1]; }).join(', ');
+
+    var providerDist = {};
+    cases.forEach(function(c) { providerDist[c.provider] = (providerDist[c.provider] || 0) + 1; });
+    var providerStr = Object.entries(providerDist).map(function(e) { return e[0] + ': ' + e[1]; }).join(', ');
+
+    var topDest = {};
+    cases.forEach(function(c) { topDest[DATA.country_names[c.destination] || c.destination] = (topDest[DATA.country_names[c.destination] || c.destination] || 0) + 1; });
+    var topDestStr = Object.entries(topDest).sort(function(a, b) { return b[1] - a[1]; }).slice(0, 5).map(function(e) { return e[0] + ' (' + e[1] + ')'; }).join(', ');
+
+    var pendingActions = cases.filter(function(c) { return c.status === 'Received' || c.status === 'In Progress'; }).length;
+
+    var expiringSoon = cases.filter(function(c) {
+      if (!c.expected_completion || c.status === 'Completed') return false;
+      var d = new Date(c.expected_completion);
+      var now = new Date();
+      var diff = (d - now) / (1000 * 60 * 60 * 24);
+      return diff >= 0 && diff <= 90;
+    }).length;
+
+    return 'Immigration Tab' + filterNote + ': ' + cases.length + ' total cases. ' +
+      'Status breakdown: ' + statusStr + '. ' +
+      pendingActions + ' pending actions (Received or In Progress). ' +
+      expiringSoon + ' cases expiring within 90 days. ' +
+      'By provider: ' + providerStr + '. ' +
+      'Top destinations: ' + topDestStr + '. ' +
+      'Key actions: review received cases, track in-progress filings, monitor approaching deadlines.';
+  }
+
+  return getTabLabel(currentTab) + ' tab is shown. This tab is coming soon — only the Immigration tab has full data in this demo.';
+}
+
+// ══ Voice / Mira — OpenAI Realtime API ═══════════════════════════════════════
+var VOICE_CONFIG = {
+  USE_REALTIME_API: true,
+  REALTIME_TOKEN_ENDPOINT: 'https://cwflqdfytvniozxcreiq.supabase.co/functions/v1/realtime-token',
+  MAX_RECONNECT_ATTEMPTS: 3,
+  SESSION_TIMEOUT_MS: 120000
+};
+
+var voiceIsListening = false;
+var currentMode = null;
+var realtimeManager = null;
+var isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+
+function buildMiraContext() {
+  var cases = filteredCases;
+  var assigneeSet = new Set(cases.map(function(c) { return c.assignee; }));
+  var destSet = new Set(cases.map(function(c) { return c.destination; }));
+  var countryFilter = document.getElementById('filt-country') ? document.getElementById('filt-country').value : 'All';
+  var statusFilter = document.getElementById('filt-status') ? document.getElementById('filt-status').value : 'All';
+  var entityFilter = document.getElementById('filt-entity') ? document.getElementById('filt-entity').value : 'All';
+
+  // Status distribution
+  var statusDist = {};
+  cases.forEach(function(c) { statusDist[c.status] = (statusDist[c.status] || 0) + 1; });
+  var statusStr = Object.entries(statusDist).map(function(e) { return e[0] + ': ' + e[1]; }).join(', ');
+
+  // Provider distribution
+  var providerDist = {};
+  cases.forEach(function(c) { providerDist[c.provider] = (providerDist[c.provider] || 0) + 1; });
+  var providerStr = Object.entries(providerDist).map(function(e) { return e[0] + ': ' + e[1]; }).join(', ');
+
+  // Top destinations
+  var destStats = {};
+  cases.forEach(function(c) {
+    var name = DATA.country_names[c.destination] || c.destination;
+    if (!destStats[name]) destStats[name] = 0;
+    destStats[name]++;
+  });
+  var topDest = Object.entries(destStats).sort(function(a, b) { return b[1] - a[1]; }).slice(0, 10);
+  var topDestStr = topDest.map(function(d) { return d[0] + ': ' + d[1] + ' cases'; }).join('; ');
+
+  // Visa type distribution
+  var visaDist = {};
+  cases.forEach(function(c) { visaDist[c.visa_type] = (visaDist[c.visa_type] || 0) + 1; });
+  var visaStr = Object.entries(visaDist).map(function(e) { return e[0] + ': ' + e[1]; }).join(', ');
+
+  // Pending actions
+  var pendingActions = cases.filter(function(c) { return c.status === 'Received' || c.status === 'In Progress'; }).length;
+
+  // Expiring within 90 days
+  var now = new Date();
+  var expiring90 = cases.filter(function(c) {
+    if (!c.expected_completion || c.status === 'Completed') return false;
+    var d = new Date(c.expected_completion);
+    var diff = (d - now) / (1000 * 60 * 60 * 24);
+    return diff >= 0 && diff <= 90;
+  }).length;
+
+  var ctx = 'DASHBOARD SNAPSHOT:\n';
+  ctx += 'Total cases: ' + cases.length + '\n';
+  ctx += 'Unique assignees: ' + assigneeSet.size + '\n';
+  ctx += 'Destination countries: ' + destSet.size + '\n';
+  ctx += 'Pending actions: ' + pendingActions + '\n';
+  ctx += 'Expiring within 90 days: ' + expiring90 + '\n';
+  ctx += 'Active filters: Destination=' + countryFilter + ', Status=' + statusFilter + ', Entity=' + entityFilter + '\n';
+  ctx += 'Current tab: ' + currentTab + '\n';
+  ctx += 'Data mode: ' + DATA_MODE + '\n\n';
+
+  ctx += 'CASE STATUS DISTRIBUTION: ' + statusStr + '\n';
+  ctx += 'BY PROVIDER: ' + providerStr + '\n';
+  ctx += 'VISA TYPES: ' + visaStr + '\n';
+  ctx += 'TOP DESTINATIONS: ' + topDestStr + '\n\n';
+
+  // Tab-specific detail
+  if (currentTab === 'immigration') {
+    ctx += 'IMMIGRATION DETAIL: The Immigration tab shows a case status donut chart, cases-by-month stacked bar chart, assignee data table, and assignee-by-destination heatmap. ';
+    ctx += pendingActions + ' cases need attention (Received or In Progress). ';
+    ctx += expiring90 + ' cases have expected completion within the next 90 days.';
+  } else if (currentTab === 'overview') {
+    ctx += 'OVERVIEW DETAIL: The Overview tab provides a summary of the Mobility Orchestrator demo, with links to the Immigration tab for full case management.';
+  } else {
+    ctx += getTabLabel(currentTab) + ' tab is a placeholder (Coming Soon). Only the Immigration tab has full data.';
+  }
+
+  return ctx;
+}
+
+function getMiraInstructions(ctx) {
+  var instructions = 'You are Mira, a voice assistant for The Cozm Mobility Orchestrator dashboard. You help users understand immigration case data, track case statuses, and navigate the dashboard.\n\n';
+  instructions += ctx + '\n\n';
+  instructions += 'CAPABILITIES:\n';
+  instructions += '- Switch between tabs: Overview, Immigration, Personal Tax, Corporate Tax, Global Mobility, Costs (only Immigration is fully populated)\n';
+  instructions += '- Filter by destination country or case status\n';
+  instructions += '- Provide detailed summaries of what is on screen\n';
+  instructions += '- Provide trend analysis for case filing patterns\n';
+  instructions += '- Explain immigration concepts: work permits, Blue Cards, intra-company transfers, A1 certificates, certificates of coverage\n\n';
+  instructions += 'TAB CONTENTS:\n';
+  instructions += '- overview: Landing page with demo description and links to Immigration tab\n';
+  instructions += '- immigration: Case status donut chart, cases-by-month stacked bar, assignee data table, assignee-by-destination heatmap, provider integration callout\n';
+  instructions += '- Other tabs: Coming soon placeholders\n\n';
+  instructions += 'CASE STATUSES: Received → In Progress → Filed → Approved → Completed\n';
+  instructions += 'PROVIDERS: Fragomen (via Connect API), Vialto Partners\n\n';
+  instructions += 'NAVIGATION:\n';
+  instructions += '- Use switch_tab to navigate between screens\n';
+  instructions += '- When asked "what is on this screen" or "summarise this view", call get_tab_summary first, then answer with specific numbers\n';
+  instructions += '- When asked for a trend analysis, call get_trend_summary first\n';
+  instructions += '- When asked to "show me immigration" or "go to cases", call switch_tab with the matching tab name\n\n';
+  instructions += 'RULES:\n';
+  instructions += '1. Introduce yourself ONLY on the very first response. After that, be direct and concise.\n';
+  instructions += '2. Use your dashboard context to answer questions directly. Call tools when the user asks to navigate, summarise, or analyse.\n';
+  instructions += '3. When the user asks to navigate, use switch_tab, then briefly confirm what tab you have moved to and mention one key number.\n';
+  instructions += '4. Reference specific numbers from the DASHBOARD SNAPSHOT or tool outputs — never give vague or generic responses.\n';
+  instructions += '5. Use British English spelling.\n';
+  instructions += '6. Keep responses concise for voice — aim for 2-3 sentences unless asked for detail.';
+  return instructions;
+}
+
+var _miraContextTimer = null;
+function debouncedMiraContextUpdate() {
+  if (_miraContextTimer) clearTimeout(_miraContextTimer);
+  _miraContextTimer = setTimeout(function() {
+    if (realtimeManager && realtimeManager.isConnected) {
+      realtimeManager.updateMiraContext();
+    }
+  }, 500);
+}
+
+class RealtimeManager {
+  constructor() {
+    this.peerConnection = null;
+    this.dataChannel = null;
+    this.audioElement = null;
+    this.localStream = null;
+    this.isConnected = false;
+    this.reconnectAttempts = 0;
+    this.sessionTimeout = null;
+    this.lastErrorMessage = '';
+  }
+
+  log(...args) { console.log('[MIRA]', ...args); }
+  error(...args) { console.error('[MIRA]', ...args); }
+
+  async connect() {
+    this.log('Initiating connection...');
+    try {
+      const tokenResponse = await fetch(VOICE_CONFIG.REALTIME_TOKEN_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      if (!tokenResponse.ok) {
+        const error = await tokenResponse.json().catch(() => ({}));
+        throw new Error(error.error || 'Token request failed: ' + tokenResponse.status);
+      }
+      const { token } = await tokenResponse.json();
+      this.log('Token obtained');
+
+      this.peerConnection = new RTCPeerConnection();
+
+      this.audioElement = document.getElementById('realtimeAudioOutput');
+      this.peerConnection.ontrack = (event) => {
+        this.log('Received audio track');
+        this.audioElement.srcObject = event.streams[0];
+      };
+
+      this.dataChannel = this.peerConnection.createDataChannel('oai-events');
+      this.dataChannel.onopen = () => {
+        this.log('Data channel opened');
+        this.isConnected = true;
+        showVoiceToast('Mira connected — speak naturally');
+        this.sendTools();
+      };
+      this.dataChannel.onclose = () => {
+        this.log('Data channel closed');
+        this.isConnected = false;
+      };
+      this.dataChannel.onerror = (err) => this.error('Data channel error:', err);
+      this.dataChannel.onmessage = (event) => this.handleServerEvent(JSON.parse(event.data));
+
+      this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      this.localStream.getTracks().forEach(track => this.peerConnection.addTrack(track, this.localStream));
+
+      const offer = await this.peerConnection.createOffer();
+      await this.peerConnection.setLocalDescription(offer);
+
+      const sdpResponse = await fetch('https://api.openai.com/v1/realtime/calls', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/sdp' },
+        body: offer.sdp
+      });
+      if (!sdpResponse.ok) throw new Error('SDP exchange failed: ' + sdpResponse.status);
+
+      const answerSdp = await sdpResponse.text();
+      await this.peerConnection.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+
+      this.log('WebRTC connection established');
+      this.reconnectAttempts = 0;
+      this.sessionTimeout = setTimeout(() => {
+        showVoiceToast('Voice session expired — click Mira to restart');
+        this.disconnect();
+        stopListening();
+      }, VOICE_CONFIG.SESSION_TIMEOUT_MS);
+      return true;
+    } catch (error) {
+      this.lastErrorMessage = (error && error.message) ? error.message : String(error || 'Unknown error');
+      this.error('Connection failed:', this.lastErrorMessage);
+      if (this.reconnectAttempts < VOICE_CONFIG.MAX_RECONNECT_ATTEMPTS) {
+        this.reconnectAttempts++;
+        showVoiceToast('Reconnecting... (' + this.reconnectAttempts + '/' + VOICE_CONFIG.MAX_RECONNECT_ATTEMPTS + ')');
+        await new Promise(r => setTimeout(r, 1000));
+        return this.connect();
+      }
+      showVoiceToast('Voice connection failed: ' + this.lastErrorMessage);
+      addChatMessage('Voice connection failed: ' + this.lastErrorMessage, 'system');
+      return false;
+    }
+  }
+
+  sendTools() {
+    if (!this.dataChannel || this.dataChannel.readyState !== 'open') return;
+    var ctx = buildMiraContext();
+    var instructions = getMiraInstructions(ctx);
+    var sessionConfig = this.buildSessionConfig(instructions);
+    this.dataChannel.send(JSON.stringify({
+      type: 'session.update',
+      session: sessionConfig
+    }));
+  }
+
+  updateMiraContext() {
+    if (!this.dataChannel || this.dataChannel.readyState !== 'open') return;
+    var ctx = buildMiraContext();
+    var instructions = getMiraInstructions(ctx);
+    var sessionConfig = this.buildSessionConfig(instructions);
+    this.dataChannel.send(JSON.stringify({
+      type: 'session.update',
+      session: sessionConfig
+    }));
+  }
+
+  buildSessionConfig(instructions) {
+    return {
+      type: 'realtime',
+      audio: {
+        input: {
+          transcription: {
+            model: 'gpt-4o-mini-transcribe',
+            language: 'en'
+          },
+          turn_detection: {
+            type: 'server_vad',
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 500
+          }
+        }
+      },
+      tool_choice: 'auto',
+      instructions: instructions,
+      tools: this.getRealtimeTools()
+    };
+  }
+
+  getRealtimeTools() {
+    return [
+      { type: 'function', name: 'switch_tab', description: 'Switch to a dashboard screen. Accepts names like Overview, Immigration, Personal Tax, Corporate Tax, Global Mobility, Costs, plus next or previous.', parameters: { type: 'object', properties: { tab_name: { type: 'string', description: 'Screen or tab to switch to' } }, required: ['tab_name'] } },
+      { type: 'function', name: 'filter_country', description: 'Filter dashboard by destination country using a country name or "All"', parameters: { type: 'object', properties: { country: { type: 'string', description: 'Country name or "All"' } }, required: ['country'] } },
+      { type: 'function', name: 'filter_status', description: 'Filter by case status: All, Received, In Progress, Filed, Approved, or Completed', parameters: { type: 'object', properties: { status: { type: 'string', description: 'Status to filter' } }, required: ['status'] } },
+      { type: 'function', name: 'get_tab_summary', description: 'Get a detailed summary of the data currently visible on the active tab including case numbers, status breakdown, and action items. Use this when the user asks for a summary or asks what they are looking at.', parameters: { type: 'object', properties: {}, required: [] } },
+      { type: 'function', name: 'get_summary_stats', description: 'Get current KPI numbers and active filters for the current screen', parameters: { type: 'object', properties: {}, required: [] } },
+      { type: 'function', name: 'get_current_view_context', description: 'Get the current visible screen, section titles, KPI values, active filters, and visible table titles', parameters: { type: 'object', properties: {}, required: [] } },
+      { type: 'function', name: 'get_trend_summary', description: 'Get a trend summary for case filings by month. Use this for questions about month-by-month patterns, peaks, or filing volume over time.', parameters: { type: 'object', properties: {}, required: [] } },
+      { type: 'function', name: 'explain_immigration', description: 'Explain an immigration or mobility concept like work permits, Blue Cards, intra-company transfers, A1 certificates, certificates of coverage', parameters: { type: 'object', properties: { topic: { type: 'string', description: 'Immigration topic to explain' } }, required: ['topic'] } }
+    ];
+  }
+
+  handleServerEvent(event) {
+    switch (event.type) {
+      case 'session.created':
+        addChatMessage('Session connected', 'system');
+        showVoiceChatPanel();
+        break;
+      case 'input_audio_buffer.speech_started':
+        showVoiceToast('Listening...');
+        break;
+      case 'input_audio_buffer.speech_stopped':
+        showVoiceToast('Processing...');
+        break;
+      case 'conversation.item.input_audio_transcription.completed':
+        addChatMessage(event.transcript, 'user');
+        break;
+      case 'response.output_audio_transcript.done':
+        if (event.transcript) addChatMessage(event.transcript, 'assistant');
+        break;
+      case 'response.function_call_arguments.done':
+        this.handleFunctionCall(event.call_id, event.name, JSON.parse(event.arguments));
+        break;
+      case 'response.done':
+        showVoiceToast('Ready');
+        break;
+      case 'session.updated':
+        console.log('[Mira] Session config accepted');
+        break;
+      case 'conversation.item.added':
+      case 'conversation.item.done':
+      case 'conversation.item.truncated':
+      case 'input_audio_buffer.committed':
+      case 'response.created':
+      case 'response.output_item.added':
+      case 'response.output_item.done':
+      case 'response.content_part.added':
+      case 'response.content_part.done':
+      case 'response.output_audio.delta':
+      case 'response.output_audio.done':
+      case 'output_audio_buffer.started':
+      case 'output_audio_buffer.cleared':
+      case 'output_audio_buffer.stopped':
+      case 'response.output_audio_transcript.delta':
+        break;
+      case 'error':
+        showVoiceToast('Error: ' + (event.error?.message || 'Unknown'));
+        addChatMessage('Error: ' + (event.error?.message || 'Unknown'), 'system');
+        break;
+    }
+  }
+
+  handleFunctionCall(callId, name, args) {
+    var result = '';
+    switch (name) {
+      case 'switch_tab':
+        var nextTab = normalizeTabName(args.tab_name);
+        if (!nextTab) {
+          result = JSON.stringify({
+            error: 'Unknown tab',
+            requested: args.tab_name,
+            available_tabs: TAB_ORDER.map(function(tab) { return getTabLabel(tab); })
+          });
+          break;
+        }
+        switchTab(nextTab);
+        result = JSON.stringify({
+          action: 'switch_tab',
+          tab_id: nextTab,
+          tab_label: getTabLabel(nextTab),
+          filtered_case_count: filteredCases.length
+        });
+        break;
+      case 'filter_country':
+        var countryCode = normalizeCountryFilter(args.country);
+        var sel = document.getElementById('filt-country');
+        if (!countryCode || !sel) {
+          result = JSON.stringify({ error: 'Unknown country filter', requested: args.country });
+          break;
+        }
+        sel.value = countryCode;
+        applyFilters();
+        result = JSON.stringify({
+          action: 'filter_country',
+          country: sel.selectedOptions[0] ? sel.selectedOptions[0].textContent.trim() : countryCode,
+          filtered_case_count: filteredCases.length,
+          tab_label: getTabLabel(currentTab)
+        });
+        break;
+      case 'filter_status':
+        var normalizedStatus = normalizeStatusFilter(args.status);
+        var ssel = document.getElementById('filt-status');
+        if (!normalizedStatus || !ssel) {
+          result = JSON.stringify({ error: 'Unknown status filter', requested: args.status });
+          break;
+        }
+        ssel.value = normalizedStatus;
+        applyFilters();
+        result = JSON.stringify({
+          action: 'filter_status',
+          status: normalizedStatus,
+          filtered_case_count: filteredCases.length,
+          tab_label: getTabLabel(currentTab)
+        });
+        break;
+      case 'get_summary_stats':
+        var _assigneeSet = new Set(filteredCases.map(function(c) { return c.assignee; }));
+        var _destSet = new Set(filteredCases.map(function(c) { return c.destination; }));
+        var _pending = filteredCases.filter(function(c) { return c.status === 'Received' || c.status === 'In Progress'; }).length;
+        result = JSON.stringify(Object.assign({
+          total_cases: filteredCases.length,
+          unique_assignees: _assigneeSet.size,
+          destination_countries: _destSet.size,
+          pending_actions: _pending
+        }, getCurrentViewSummary()));
+        break;
+      case 'get_current_view_context':
+        result = JSON.stringify(getCurrentViewSummary());
+        break;
+      case 'get_trend_summary':
+        result = getTrendSummary();
+        break;
+      case 'explain_immigration':
+        result = 'Topic: ' + args.topic + '. Please explain based on your knowledge of international immigration and global mobility.';
+        break;
+      case 'get_tab_summary':
+        result = getTabSummary();
+        break;
+      default:
+        result = 'Unknown function: ' + name;
+    }
+
+    // Send function result back
+    if (this.dataChannel && this.dataChannel.readyState === 'open') {
+      this.dataChannel.send(JSON.stringify({
+        type: 'conversation.item.create',
+        item: {
+          type: 'function_call_output',
+          call_id: callId,
+          output: result
+        }
+      }));
+      this.dataChannel.send(JSON.stringify({ type: 'response.create' }));
+    }
+  }
+
+  disconnect() {
+    if (this.sessionTimeout) { clearTimeout(this.sessionTimeout); this.sessionTimeout = null; }
+    if (this.dataChannel) { this.dataChannel.close(); this.dataChannel = null; }
+    if (this.peerConnection) { this.peerConnection.close(); this.peerConnection = null; }
+    if (this.localStream) { this.localStream.getTracks().forEach(t => t.stop()); this.localStream = null; }
+    if (this.audioElement) this.audioElement.srcObject = null;
+    this.isConnected = false;
+  }
 }
 
 function toggleVoice() {
-  var panel = document.getElementById('voiceChatPanel');
-  if (panel.classList.contains('hidden')) {
-    panel.classList.remove('hidden');
-    showVoiceToast('Mira voice assistant — requires OpenAI Realtime API key');
+  if (voiceIsListening) { stopListening(); } else { startListening(); }
+}
+
+async function startListening() {
+  if (!window.isSecureContext) {
+    showVoiceToast('Voice requires HTTPS or localhost');
+    return;
+  }
+  try {
+    var devices = await navigator.mediaDevices.enumerateDevices();
+    if (!devices.some(d => d.kind === 'audioinput')) {
+      showVoiceToast('No microphone detected');
+      return;
+    }
+  } catch(e) {}
+
+  if (VOICE_CONFIG.USE_REALTIME_API && !isSafari) {
+    if (!realtimeManager) realtimeManager = new RealtimeManager();
+    var connected = await realtimeManager.connect();
+    if (connected) {
+      currentMode = 'realtime';
+      voiceIsListening = true;
+      updateVoiceButtonUI(true);
+      return;
+    }
+  }
+  var failureReason = realtimeManager && realtimeManager.lastErrorMessage ? ': ' + realtimeManager.lastErrorMessage : '';
+  showVoiceToast('Voice connection unavailable' + failureReason);
+}
+
+function stopListening() {
+  voiceIsListening = false;
+  if (currentMode === 'realtime' && realtimeManager) realtimeManager.disconnect();
+  currentMode = null;
+  updateVoiceButtonUI(false);
+  showVoiceToast('Voice off');
+}
+
+function updateVoiceButtonUI(listening) {
+  var btn = document.getElementById('voiceBtn');
+  var txt = document.getElementById('voiceBtnText');
+  if (listening) {
+    if (btn) btn.classList.add('listening');
+    if (txt) txt.textContent = 'Listening...';
   } else {
-    panel.classList.add('hidden');
+    if (btn) btn.classList.remove('listening');
+    if (txt) txt.textContent = 'Mira';
   }
 }
+
+function showVoiceToast(message) {
+  var toast = document.getElementById('voiceToast');
+  if (!toast) return;
+  toast.textContent = message;
+  toast.classList.add('visible');
+  if (toast._t) clearTimeout(toast._t);
+  toast._t = setTimeout(function() { toast.classList.remove('visible'); }, 3000);
+}
+
+function addChatMessage(text, type) {
+  var el = document.getElementById('voiceChatMessages');
+  if (!el) return;
+  var empty = el.querySelector('.voice-chat-empty');
+  if (empty) empty.remove();
+  var msg = document.createElement('div');
+  msg.className = 'voice-chat-message ' + (type || 'system');
+  msg.textContent = text;
+  el.appendChild(msg);
+  el.scrollTop = el.scrollHeight;
+  if (el.querySelectorAll('.voice-chat-message').length > 50) el.firstElementChild.remove();
+}
+
+function toggleVoiceChatPanel() {
+  var p = document.getElementById('voiceChatPanel');
+  if (p) p.classList.toggle('hidden');
+}
+function showVoiceChatPanel() {
+  var p = document.getElementById('voiceChatPanel');
+  if (p) p.classList.remove('hidden');
+}
 </script>
+
+<!-- Realtime Audio Output -->
+<audio id="realtimeAudioOutput" autoplay style="display:none;"></audio>
 </body>
 </html>
